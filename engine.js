@@ -2,25 +2,55 @@
   'use strict';
   const D = root.CS_DATA || (typeof require !== 'undefined' ? require('./data.js') : null);
   const stats = ['code','theory','algorithm','research','social','health','mood'];
-  const labels = {code:'编程',theory:'理论',algorithm:'算法',research:'科研',social:'人脉',health:'健康',mood:'心态',money:'生活费',study:'课程掌握',thesis:'毕业设计',projectProgress:'项目进度',paperProgress:'论文进度'};
+  const labels = {code:'编程',theory:'理论',algorithm:'算法',research:'科研',social:'人脉',health:'健康',mood:'心态',money:'生活费',study:'课程掌握',thesis:'毕业设计',projectProgress:'项目进度',paperProgress:'论文进度',projects:'完成项目',papers:'科研成果',awards:'竞赛获奖',internSteps:'实习进度'};
   const clamp = (n,a=0,b=100) => Math.min(b,Math.max(a,n));
   const clone = s => JSON.parse(JSON.stringify(s));
+  const growthSnapshot = s => ({...Object.fromEntries(Object.keys(labels).map(k=>[k,s[k]])),projectProgress:s.projects*100+s.projectProgress,paperProgress:s.papers*100+s.paperProgress});
+  const growthChanges = (before,after) => Object.fromEntries(Object.keys(labels).map(k=>[k,after[k]-before[k]]).filter(([,v])=>v!==0));
   function random(s) { s.seed = (Math.imul(s.seed,1664525)+1013904223)>>>0; return s.seed/4294967296; }
+  function drawTalents(seed,count=8) {
+    if(!Number.isInteger(seed)||!Number.isInteger(count)||count<1||count>D.talents.length)throw Error('无效的天赋抽取参数');
+    const rng={seed:seed>>>0},pool=[...D.talents],draw=[];
+    const weights={common:6,uncommon:3,rare:1};
+    while(draw.length<count){
+      const total=pool.reduce((n,t)=>n+(weights[t.rarity]||6),0);
+      let roll=random(rng)*total,index=pool.length-1;
+      for(let i=0;i<pool.length;i++){roll-=weights[pool[i].rarity]||6;if(roll<0){index=i;break;}}
+      draw.push(pool.splice(index,1)[0].id);
+    }
+    return draw;
+  }
+  function chosenTalents(s){return s.talents.map(id=>D.talents.find(t=>t.id===id)).filter(Boolean);}
+  function actionEffects(s,a){
+    const effects={...a.effects};
+    for(const t of chosenTalents(s))for(const[k,v]of Object.entries(t.actions?.[a.id]||{}))effects[k]=(effects[k]||0)+v;
+    if(a.id==='course')effects.study=(effects.study||0)+Math.floor(s.theory/20);
+    if(a.id==='project')effects.projectProgress=(effects.projectProgress||0)+25+Math.floor(clamp(s.code+(effects.code||0))/20)*5;
+    if(a.id==='lab')effects.paperProgress=(effects.paperProgress||0)+20+(clamp(s.research+(effects.research||0))>=60?5:0)+Math.floor(s.social/25)*2;
+    return effects;
+  }
+  function actionPreview(s,id){const a=D.actions.find(a=>a.id===id);if(!a)throw Error('未知行动');return actionEffects(s,a);}
   function log(s,text,type='normal') { s.log.unshift({semester:s.semester,week:s.week,text,type}); s.log=s.log.slice(0,200); }
   function create(config={}) {
     const bg = D.backgrounds.find(b=>b.id===config.background) || D.backgrounds[0];
     const talents = [...new Set(config.talents||[])].filter(t=>D.talents.some(x=>x.id===t)).slice(0,2);
     const s = {version:D.version,name:String(config.name||'新同学').trim().slice(0,16)||'新同学',background:bg.id,talents,
-      seed:(Number(config.seed)||Date.now())>>>0,semester:1,week:1,phase:'planning',plan:[],
+      seed:(Number.isInteger(config.seed)?config.seed:Date.now())>>>0,semester:1,week:1,phase:'planning',plan:[],
       code:8,theory:8,algorithm:5,research:0,social:10,health:85,mood:80,money:bg.money,
       study:0,thesis:0,projectProgress:0,paperProgress:0,projects:0,papers:0,awards:0,internSteps:0,
-      credits:0,failed:0,grades:[],achievements:[],seen:[],log:[],pendingEvent:null,report:null,ending:null,weeksPlayed:0};
+      credits:0,failed:0,grades:[],achievements:[],seen:[],log:[],pendingEvent:null,lastEvent:null,lastWeek:null,report:null,ending:null,weeksPlayed:0};
     apply(s,bg.bonus);
+    for(const t of chosenTalents(s))apply(s,t.start);
     log(s,'拿到录取通知书，搬进四人寝。你好，计算机科学与技术。','milestone');
     log(s,'本周安排 3 项行动，再点击「开始这一周」。每学期用 4 个关键周推进。');
     return s;
   }
   function gpa(s) {return s.grades.length ? s.grades.reduce((a,b)=>a+b.gpa,0)/s.grades.length : 0;}
+  function semesterForecast(s){
+    const parts={course:s.study*.024,theory:s.theory*.008,code:s.code*.003,base:1.2-s.semester*.06};
+    const total=parts.course+parts.theory+parts.code+parts.base;
+    return {...parts,min:Number(clamp(total-.11,0,4).toFixed(2)),max:Number(clamp(total+.11,0,4).toFixed(2))};
+  }
   function apply(s,effects) {
     for(const [key,value] of Object.entries(effects||{})) {
       if(stats.includes(key)||key==='thesis') s[key]=clamp(s[key]+value);
@@ -43,8 +73,8 @@
     const a=D.actions.find(x=>x.id===id), reason=locked(s,a);
     if(reason) return reason;
     if(id==='retake' && s.plan.filter(x=>x===id).length>=s.failed) return '补考已安排';
-    const budget=s.money+s.plan.reduce((v,p)=>v+(D.actions.find(x=>x.id===p).effects.money||0),0);
-    if(budget+(a.effects.money||0)<0) return '生活费不足，先安排兼职';
+    const budget=s.money+s.plan.reduce((v,p)=>v+(actionEffects(s,D.actions.find(x=>x.id===p)).money||0),0);
+    if(budget+(actionEffects(s,a).money||0)<0) return '生活费不足，先安排兼职';
     return '';
   }
   function addPlan(s,id) {const reason=planError(s,id); if(reason) throw Error(reason); s.plan.push(id);}
@@ -59,18 +89,12 @@
   }
   function action(s,id) {
     const a=D.actions.find(x=>x.id===id),reason=locked(s,a);
-    if(reason || s.money+(a.effects.money||0)<0) {log(s,`${a.name}未能进行：${reason||'生活费不足'}，改为好好休息。`);apply(s,{health:12,mood:18});return;}
-    const e={...a.effects};
-    if(id==='algorithm' && s.talents.includes('logic')) e.algorithm+=3;
-    if(id==='course' && s.talents.includes('academic')) e.theory+=3;
-    if(id==='lab' && s.talents.includes('academic')) e.research+=3;
-    if(id==='social' && s.talents.includes('social')) {e.mood+=5;e.social+=3;}
+    const e=actionEffects(s,a);
+    if(reason || s.money+(e.money||0)<0) {log(s,`${a.name}未能进行：${reason||'生活费不足'}，改为好好休息。`);apply(s,{health:12,mood:18});return;}
     apply(s,e);
-    if(id==='project') apply(s,{projectProgress:25+Math.floor(s.code/20)*5+(s.talents.includes('builder')?10:0)});
-    if(id==='lab') apply(s,{paperProgress:20+(s.research>=60?5:0)});
     if(id==='intern') {s.internSteps++;if(s.internSteps%2===0)log(s,`完成第 ${s.internSteps/2} 段实习，简历里多了一段真实的经历。`,'milestone');}
     if(id==='contest') {
-      const chance=clamp(.10+s.algorithm*.007+s.social*.001,0,.9);
+      const chance=clamp(.10+s.algorithm*.007+s.social*.001+chosenTalents(s).reduce((n,t)=>n+(t.contestBonus||0),0),0,.9);
       if(random(s)<chance){s.awards++;apply(s,{money:300,mood:10});log(s,'比赛获奖了！队友的欢呼声，比 Accepted 还好听。奖金 ¥300。','milestone');}
       else {apply(s,{algorithm:3});log(s,'比赛没能获奖，但赛后补题让算法再提升了 3 点。');}
     }
@@ -78,35 +102,73 @@
     log(s,`${a.name} · ${Object.entries(e).map(([k,v])=>`${labels[k]} ${v>0?'+':''}${v}`).join('，')}`);
     milestones(s);
   }
+  function eventWeight(s,event){
+    if(s.semester<(event.min||1)||s.semester>(event.max||8))return 0;
+    for(const r of event.requires||[]){if(!Number.isFinite(s[r.stat])||(r.min!==undefined&&s[r.stat]<r.min)||(r.max!==undefined&&s[r.stat]>r.max))return 0;}
+    let weight=event.weight??1;
+    const caps={money:2000,semester:8,projects:5,papers:3,awards:5,internSteps:6};
+    for(const b of event.bias||[]){const value=clamp((s[b.stat]||0)/(caps[b.stat]||100),0,1);weight*=1+(b.direction==='low'?1-value:value)*b.factor;}
+    return Math.max(0,weight);
+  }
+  function eventPool(s){
+    const eligible=D.events.map(event=>({event,weight:eventWeight(s,event)})).filter(x=>x.weight>0);
+    const fresh=eligible.filter(x=>!s.seen.includes(x.event.id));
+    return fresh.length?fresh:eligible;
+  }
+  function choiceError(s,choice){
+    if(!choice)return '无效的事件选项';
+    for(const[k,min]of Object.entries(choice.require||{}))if(!Number.isFinite(s[k])||s[k]<min)return `需要${labels[k]||k} ${min}`;
+    if(s.money+(choice.effects?.money||0)<0)return '生活费不足';
+    return '';
+  }
+  function checkChance(s,check){
+    if(!check||!stats.includes(check.stat)||!Number.isFinite(check.difficulty))throw Error('无效的属性检定');
+    const bonus=chosenTalents(s).reduce((n,t)=>n+(t.checkBonuses?.[check.stat]||0),0);
+    return clamp(.55+(s[check.stat]-check.difficulty)*.008+bonus,.10,.95);
+  }
   function advance(s) {
     if(s.phase!=='planning'||s.plan.length!==3) throw Error('请先安排 3 项行动');
+    const before=growthSnapshot(s);
     const plan=[...s.plan];s.plan=[];
     for(const id of plan) action(s,id);
     const bg=D.backgrounds.find(b=>b.id===s.background);
-    const expense=s.talents.includes('thrifty')?110:180;
+    const expense=Math.max(0,180-chosenTalents(s).reduce((n,t)=>n+(t.expenseDiscount||0),0));
     apply(s,{money:bg.income-expense});
-    if(s.talents.includes('healthy')) apply(s,{health:4});
+    for(const t of chosenTalents(s))apply(s,t.weekly);
     log(s,`本周生活费 +¥${bg.income}，日常开销 −¥${expense}。`);
     if(s.health<15 || s.mood<15) {
       apply(s,{health:25,mood:25,money:-Math.min(s.money,150)});
       log(s,'身体和情绪亮起红灯。你暂停额外安排，接受帮助并休整了一段时间（支出最多 ¥150）。下周记得留出休息。','warning');
     }
+    s.lastWeek={semester:s.semester,week:s.week,effects:growthChanges(before,growthSnapshot(s))};
     s.weeksPlayed++;
-    let pool=D.events.filter(e=>s.semester>=(e.min||1)&&s.semester<=(e.max||8)&&!s.seen.includes(e.id));
-    if(!pool.length) pool=D.events.filter(e=>s.semester>=(e.min||1)&&s.semester<=(e.max||8));
-    const ev=pool[Math.floor(random(s)*pool.length)];
+    const pool=eventPool(s);
+    let roll=random(s)*pool.reduce((n,e)=>n+e.weight,0),ev=pool[pool.length-1].event;
+    for(const item of pool){roll-=item.weight;if(roll<0){ev=item.event;break;}}
     s.pendingEvent=ev.id;if(!s.seen.includes(ev.id))s.seen.push(ev.id);s.phase='event';
   }
   function choose(s,index) {
     if(s.phase!=='event') throw Error('当前没有待处理的事件');
     const event=D.events.find(e=>e.id===s.pendingEvent),c=event?.choices[index];
     if(!Number.isInteger(index)||!c) throw Error('无效的事件选项');
-    if(s.money+(c.effects.money||0)<0) throw Error('生活费不足');
-    apply(s,c.effects);log(s,`${event.title}：${c.result}`,'event');s.pendingEvent=null;milestones(s);
+    const reason=choiceError(s,c);if(reason)throw Error(reason);
+    const chance=c.check?checkChance(s,c.check):null;
+    const outcome=c.check?(random(s)<chance?'success':'failure'):'normal';
+    const branch=c.check?c.check[outcome]:c;
+    const before=growthSnapshot(s);
+    apply(s,c.effects);
+    if(c.check)apply(s,branch.effects);
+    milestones(s);
+    const effects=growthChanges(before,growthSnapshot(s));
+    const result={title:event.title,result:branch.result,outcome,effects,chance};
+    s.lastEvent=result;
+    log(s,`${event.title}${outcome==='normal'?'':outcome==='success'?'【检定成功】':'【检定未达成】'}：${branch.result}${Object.keys(effects).length?'（'+effectsText(effects)+'）':''}`,'event');s.pendingEvent=null;
     if(s.week===4) semesterEnd(s);else{s.week++;s.phase='planning';}
+    return result;
   }
   function semesterEnd(s) {
-    const score=Number(clamp(1.2+s.study*.024+s.theory*.008+s.code*.003-s.semester*.06+(random(s)-.5)*.22,0,4).toFixed(2));
+    const forecast=semesterForecast(s);
+    const score=Number(clamp(forecast.base+forecast.course+forecast.theory+forecast.code+(random(s)-.5)*.22,0,4).toFixed(2));
     const passed=score>=2;
     s.credits+=passed?20:12;if(!passed)s.failed++;
     s.grades.push({semester:s.semester,gpa:score,repaired:false});
@@ -156,6 +218,8 @@
     if(!Array.isArray(s.achievements)||s.achievements.some(id=>!D.achievements.some(a=>a.id===id)))throw Error('成就数据无效');
     if(!Array.isArray(s.seen)||s.seen.length>D.events.length||s.seen.some(id=>!D.events.some(e=>e.id===id)))throw Error('事件数据无效');
     if(s.phase==='event'&&!D.events.some(e=>e.id===s.pendingEvent))throw Error('待处理事件无效');
+    if(s.lastEvent!==undefined&&s.lastEvent!==null){const e=s.lastEvent;if(typeof e.title!=='string'||e.title.length>200||typeof e.result!=='string'||e.result.length>2000||!['success','failure','normal'].includes(e.outcome)||!e.effects||typeof e.effects!=='object'||Array.isArray(e.effects)||Object.entries(e.effects).some(([k,v])=>!Object.hasOwn(labels,k)||!Number.isFinite(v)||Math.abs(v)>1000000)||(e.chance!==null&&(!Number.isFinite(e.chance)||e.chance<.1||e.chance>.95)))throw Error('事件结果无效');}
+    if(s.lastWeek!==undefined&&s.lastWeek!==null){const w=s.lastWeek;if(!Number.isInteger(w.semester)||w.semester<1||w.semester>8||!Number.isInteger(w.week)||w.week<1||w.week>4||!w.effects||typeof w.effects!=='object'||Array.isArray(w.effects)||Object.entries(w.effects).some(([k,v])=>!Object.hasOwn(labels,k)||!Number.isFinite(v)||Math.abs(v)>1000000))throw Error('每周成长记录无效');}
     if(s.phase==='report'&&(!s.report||s.week!==4||s.report.semester!==s.semester||!Number.isFinite(s.report.gpa)||s.report.gpa<0||s.report.gpa>4||![12,20].includes(s.report.credits)||![0,300,600].includes(s.report.scholarship)||typeof s.report.passed!=='boolean'))throw Error('学期报告无效');
     if(s.phase==='ending'&&(s.semester!==8||s.week!==4))throw Error('毕业数据无效');
     const clean=create({name:s.name,background:s.background,talents:s.talents,seed:s.seed});
@@ -163,6 +227,6 @@
     if(s.phase==='ending')clean.ending=getEnding(clean);
     return clean;
   }
-  const E={create,gpa,locked,planError,addPlan,removePlan,advance,choose,continueTerm,getEnding,effectsText,validate,clone,labels};
+  const E={create,drawTalents,gpa,semesterForecast,actionPreview,locked,planError,addPlan,removePlan,advance,choose,continueTerm,getEnding,effectsText,eventWeight,eventPool,choiceError,checkChance,validate,clone,labels};
   root.CS_ENGINE=E;if(typeof module!=='undefined')module.exports=E;
 })(typeof globalThis!=='undefined'?globalThis:window);
