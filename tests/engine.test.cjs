@@ -7,6 +7,8 @@ const plan=(s,ids)=>ids.forEach(id=>E.addPlan(s,id));
 const resolve=s=>{const event=D.events.find(e=>e.id===s.pendingEvent);const choices=event.choices.map((choice,index)=>({choice,index})).filter(({choice})=>!E.choiceError(s,choice));const safe=choices.find(({choice})=>!choice.check);assert.ok(safe||choices[0],`${event.id} must have an available choice`);return E.choose(s,(safe||choices[0]).index);};
 const withEvent=(event,run)=>{D.events.push(event);try{return run(event);}finally{D.events.pop();}};
 const pending=(event,seed=42)=>{const s=E.create({background:'ordinary',talents:[],seed});s.phase='event';s.pendingEvent=event.id;return s;};
+const unchangedOnError=(s,fn)=>{const before=JSON.stringify(s);assert.throws(fn);assert.equal(JSON.stringify(s),before);};
+const calendar=s=>(s.semester-1)*4+s.week;
 const routeFixture=(route,semester,week,overrides={})=>{
   const s=E.create({talents:[],seed:42});
   Object.assign(s,{semester,week,weeksPlayed:(semester-1)*4+week-1,credits:(semester-1)*20,study:100,code:100,theory:100,algorithm:100,research:100,social:100,health:100,mood:100,projects:3,papers:1,internSteps:4,recommendPrep:100,examPrep:100,jobPrep:100,interviewPrep:100});
@@ -15,6 +17,196 @@ const routeFixture=(route,semester,week,overrides={})=>{
 };
 const settleRouteWeek=s=>withEvent({id:'test-route-neutral',title:'平静的一周',choices:[{result:'按计划继续生活。',effects:{}}]},event=>{s.phase='event';s.pendingEvent=event.id;return E.choose(s,0);});
 const routeRecord=(stage,status='success',score=90)=>{const [semester,week]={recommend:[7,2],written:[7,4],retest:[8,2],job:[8,3]}[stage];return {status,score,reason:'已结算的阶段结果',semester,week};};
+
+test('shop purchases spend real money and invalid purchases or uses leave state unchanged',()=>{
+  const s=fresh(),money=s.money,result=E.buyItem(s,'algorithm-book');
+  assert.equal(s.money,money-360);assert.equal(s.inventory['algorithm-book'],1);assert.equal(result.effects.money,-360);
+  assert.ok(result.changes.some(text=>text.includes('算法书')));assert.equal(E.itemStatus(s,'algorithm-book').canBuy,false);
+  unchangedOnError(s,()=>E.buyItem(s,'algorithm-book'));unchangedOnError(s,()=>E.useItem(s,'algorithm-book'));
+  unchangedOnError(s,()=>E.buyItem(s,'missing'));unchangedOnError(s,()=>E.useItem(s,'coffee'));
+  s.money=0;unchangedOnError(s,()=>E.buyItem(s,'coffee'));s.money=10000;
+  for(let i=0;i<3;i++)E.buyItem(s,'coffee');unchangedOnError(s,()=>E.buyItem(s,'coffee'));
+  E.buyItem(s,'repair-kit');unchangedOnError(s,()=>E.useItem(s,'repair-kit'));
+  for(const phase of ['event','report','ending']){s.phase=phase;unchangedOnError(s,()=>E.buyItem(s,'meal-pack'));unchangedOnError(s,()=>E.useItem(s,'coffee'));}
+  s.phase='planning';s.health=95;s.mood=99;E.buyItem(s,'meal-pack');const used=E.useItem(s,'meal-pack');
+  assert.deepEqual(used.effects,{health:5,mood:1});assert.equal(s.inventory['meal-pack'],undefined);
+  assert.equal(E.itemStatus(s,'meal-pack').owned,0);assert.deepEqual(E.validate(JSON.parse(JSON.stringify(s))),s);
+});
+
+test('shop spending preserves the budget of each scheduled action in order',()=>{
+  const s=fresh();s.money=400;plan(s,['social','work','social']);
+  unchangedOnError(s,()=>E.buyItem(s,'algorithm-book'));
+  assert.match(E.itemStatus(s,'algorithm-book').buyReason,/已安排/);
+  s.plan=[];plan(s,['work','social','social']);E.buyItem(s,'algorithm-book');
+  assert.equal(s.money,40);E.advance(s);
+  assert.ok(!s.log.some(entry=>entry.text.includes('未能进行')),'scheduled income should pay for the later activities');
+});
+
+test('permanent books and equipment change actual actions and keep working after reload',()=>{
+  for(const [item,action,stat,bonus]of [['algorithm-book','algorithm','algorithm',3],['systems-book','course','theory',2],['laptop-upgrade','project','projectProgress',10],['headphones','code','mood',2],['running-shoes','exercise','health',4]]){
+    const plain=E.create({talents:[],seed:42}),equipped=E.create({talents:[],seed:42});
+    for(const s of [plain,equipped])Object.assign(s,{money:5000,code:40,theory:40,health:30,mood:30});
+    E.buyItem(equipped,item);const loaded=E.validate(JSON.parse(JSON.stringify(equipped)));
+    for(const s of [plain,equipped,loaded]){plan(s,[action,'rest','rest']);E.advance(s);}
+    assert.equal(equipped[stat]-plain[stat],bonus,item);assert.deepEqual(loaded,equipped);assert.equal(equipped.inventory[item],1);
+  }
+  const s=fresh(),bookAction=D.actions.find(a=>a.id==='book-study');assert.ok(E.locked(s,bookAction));
+  E.buyItem(s,'algorithm-book');assert.equal(E.locked(s,bookAction),'');plan(s,['book-study','rest','rest']);E.advance(s);assert.ok(s.algorithm>5);
+});
+
+test('activity tickets cannot be overbooked and are consumed once by the activity',()=>{
+  const s=fresh();E.buyItem(s,'conference-ticket');unchangedOnError(s,()=>E.useItem(s,'conference-ticket'));
+  E.addPlan(s,'conference-visit');unchangedOnError(s,()=>E.addPlan(s,'conference-visit'));plan(s,['rest','rest']);
+  E.advance(s);assert.equal(s.inventory['conference-ticket'],undefined);assert.ok(s.perks.includes('conference-network'));
+  assert.equal(s.lastWeek.notes.filter(note=>note.includes('消耗')).length,1);assert.ok(E.locked(s,D.actions.find(a=>a.id==='conference-visit')));
+  settleRouteWeek(s);E.buyItem(s,'conference-ticket');plan(s,['conference-visit','rest','rest']);E.advance(s);
+  assert.equal(s.perks.filter(id=>id==='conference-network').length,1);
+});
+
+test('temporary effects benefit all actions for two weeks and tick only on weekly settlement',()=>{
+  const plain=E.create({talents:[],seed:42}),boosted=E.create({talents:[],seed:42});
+  E.buyItem(boosted,'coffee');E.buyItem(boosted,'coffee');E.useItem(boosted,'coffee');
+  assert.equal(boosted.buffs.focus,2);assert.equal(boosted.inventory.coffee,1);
+  unchangedOnError(boosted,()=>E.useItem(boosted,'coffee'));
+  for(let week=1;week<=3;week++){
+    const before=boosted.algorithm-plain.algorithm;
+    for(const s of [plain,boosted]){plan(s,['algorithm','algorithm','rest']);E.advance(s);}
+    assert.equal(boosted.algorithm-plain.algorithm-before,week<=2?4:0);
+    assert.equal(boosted.buffs.focus,week===1?1:undefined);
+    assert.deepEqual(E.validate(JSON.parse(JSON.stringify(boosted))),boosted);
+    unchangedOnError(boosted,()=>E.advance(boosted));
+    for(const s of [plain,boosted])settleRouteWeek(s);
+    assert.equal(boosted.buffs.focus,week===1?1:undefined);
+  }
+  E.useItem(boosted,'coffee');assert.equal(boosted.buffs.focus,2);assert.equal(boosted.inventory.coffee,undefined);
+  const normal=routeFixture('undecided',3,1,{code:40,research:30,projectProgress:0,paperProgress:0}),cloud=E.clone(normal);
+  E.buyItem(cloud,'cloud-credit');E.useItem(cloud,'cloud-credit');
+  for(const s of [normal,cloud]){plan(s,['project','lab','rest']);E.advance(s);}
+  assert.equal(cloud.projectProgress-normal.projectProgress,12);assert.equal(cloud.paperProgress-normal.paperProgress,8);
+});
+
+test('all four stories unlock real work, prioritize followups and give rewards only once',()=>{
+  for(const def of D.stories){
+    const s=routeFixture('undecided',3,1),invite=D.events.find(e=>e.choices.some(c=>c.startStory===def.id));
+    const join=invite.choices.findIndex(c=>c.startStory===def.id),started=calendar(s);
+    const description=E.choiceConsequencesText(s,invite.choices[join]);assert.ok(description.some(text=>text.includes(def.name)));
+    s.phase='event';s.pendingEvent=invite.id;s.seen.push(invite.id);const joined=E.choose(s,join);
+    assert.equal(s.stories[def.id].startedWeek,started);assert.equal(s.stories[def.id].dueWeek,started+def.duration);
+    assert.equal(E.storyStatus(s,def.id).remainingWeeks,def.duration);assert.ok(joined.changes.some(text=>text.includes(def.name)));
+    assert.equal(E.locked(s,D.actions.find(a=>a.id===def.actionId)),'');
+    const followup=D.events.find(e=>e.id===def.followupEvent),complete=followup.choices.findIndex(c=>c.resolveStory?.outcome==='completed');
+    assert.ok(E.choiceError(s,followup.choices[complete]),'unfinished work must not be deliverable');
+    const actions=Array(def.target).fill(def.actionId);while(actions.length<3)actions.push('rest');plan(s,actions);E.advance(s);
+    assert.equal(s.stories[def.id].progress,def.target);assert.equal(s.pendingEvent,def.followupEvent);
+    assert.ok(s.lastWeek.notes.some(text=>text.includes(def.name)));assert.equal(E.storyStatus(s,def.id).ready,true);
+    const loaded=E.validate(JSON.parse(JSON.stringify(s))),before=s.money,completed=E.choose(s,complete);E.choose(loaded,complete);
+    assert.deepEqual(loaded,s);assert.equal(s.stories[def.id].status,'completed');assert.equal(s.stories[def.id].ending,followup.choices[complete].result);
+    assert.equal(s.money-before,followup.choices[complete].effects.money||0);assert.ok(s.perks.includes(followup.choices[complete].grantPerk));
+    assert.ok(completed.changes.some(text=>text.includes(def.name)));assert.ok(completed.changes.some(text=>text.includes('长期收获')));
+    assert.ok(E.choiceError(s,invite.choices[join]));assert.equal(E.eventWeight(s,invite),0);
+    s.phase='event';s.pendingEvent=followup.id;unchangedOnError(s,()=>E.choose(s,complete));s.phase='planning';s.pendingEvent=null;
+    if(def.id==='study-group')assert.equal(E.locked(s,D.actions.find(a=>a.id===def.actionId)),'','completed study partners remain available');
+    else if(def.id!=='campus-product')assert.ok(E.locked(s,D.actions.find(a=>a.id===def.actionId)));
+    assert.deepEqual(E.validate(JSON.parse(JSON.stringify(s))),s);
+  }
+});
+
+test('the last allowed story week can finish work, while uncompleted delivery permits cancellation without reward',()=>{
+  const def=D.stories.find(story=>story.id==='freelance'),invite=D.events.find(e=>e.id==='freelance-invite');
+  for(const finish of [true,false]){
+    const s=routeFixture('undecided',3,1);s.phase='event';s.pendingEvent=invite.id;E.choose(s,0);
+    while(calendar(s)<s.stories.freelance.dueWeek){plan(s,['rest','rest','rest']);E.advance(s);assert.notEqual(s.pendingEvent,def.followupEvent);settleRouteWeek(s);}
+    assert.equal(E.storyStatus(s,'freelance').remainingWeeks,1);assert.equal(E.locked(s,D.actions.find(a=>a.id===def.actionId)),'');
+    plan(s,finish?[def.actionId,def.actionId,'rest']:['rest','rest','rest']);E.advance(s);assert.equal(s.pendingEvent,def.followupEvent);
+    if(finish){E.choose(s,0);assert.equal(s.stories.freelance.status,'completed');}
+    else{const before=s.money;unchangedOnError(s,()=>E.choose(s,0));const canceled=E.choose(s,1);assert.equal(canceled.effects.money||0,0);assert.equal(s.money-before,s.report?.scholarship||0);assert.equal(s.stories.freelance.status,'abandoned');assert.ok(!s.perks.includes('client-trust'));}
+    assert.equal(s.stories.freelance.resolvedWeek,s.stories.freelance.dueWeek);assert.ok(s.stories.freelance.ending.length>0);
+  }
+});
+
+test('simultaneous story followups use the oldest deadline and preserve completed work awaiting resolution',()=>{
+  const s=routeFixture('undecided',4,1);
+  s.stories.freelance={status:'active',progress:2,startedWeek:9,dueWeek:12,resolvedWeek:null,ending:''};
+  s.stories['open-source']={status:'active',progress:2,startedWeek:9,dueWeek:13,resolvedWeek:null,ending:''};
+  assert.equal(E.eventPool(s)[0].event.id,'freelance-delivery');assert.ok(E.locked(s,D.actions.find(a=>a.id==='freelance-work')));
+  plan(s,['rest','rest','rest']);E.advance(s);E.choose(s,0);
+  assert.equal(E.eventPool(s)[0].event.id,'open-source-review');assert.ok(E.locked(s,D.actions.find(a=>a.id==='open-source-work')));
+  plan(s,['rest','rest','rest']);E.advance(s);E.choose(s,0);
+  assert.equal(s.stories.freelance.status,'completed');assert.equal(s.stories['open-source'].status,'completed');
+  assert.deepEqual(E.validate(JSON.parse(JSON.stringify(s))),s);
+});
+
+test('graduation records unresolved stories as abandoned instead of leaving active work',()=>{
+  const s=routeFixture('undecided',8,4);
+  s.stories.freelance={status:'active',progress:0,startedWeek:29,dueWeek:32,resolvedWeek:null,ending:''};
+  s.stories['open-source']={status:'active',progress:0,startedWeek:28,dueWeek:32,resolvedWeek:null,ending:''};
+  plan(s,['rest','rest','rest']);E.advance(s);E.choose(s,1);assert.equal(s.phase,'report');
+  assert.equal(Object.values(s.stories).filter(story=>story.status==='active').length,1);E.continueTerm(s);
+  for(const story of Object.values(s.stories)){assert.equal(story.status,'abandoned');assert.equal(story.resolvedWeek,32);assert.ok(story.ending);}
+  assert.deepEqual(E.validate(JSON.parse(JSON.stringify(s))),s);
+});
+
+test('computer failure blocks development until a repair kit or borrowed computer resolves it',()=>{
+  const event=D.events.find(e=>e.id==='laptop-breakdown'),project=D.actions.find(a=>a.id==='project');
+  for(const method of ['repair-kit','borrow-laptop']){
+    const s=routeFixture('undecided',3,1);s.phase='event';s.pendingEvent=event.id;const result=E.choose(s,2);
+    assert.ok(result.changes.some(text=>text.includes('电脑故障')));assert.ok(s.conditions.includes('broken-laptop'));
+    unchangedOnError(s,()=>E.addPlan(s,'project'));
+    if(method==='repair-kit'){E.buyItem(s,method);const fixed=E.useItem(s,method);assert.ok(fixed.changes.some(text=>text.includes('解除')));assert.equal(s.inventory[method],undefined);}
+    else{plan(s,[method,'rest','rest']);E.advance(s);assert.ok(s.lastWeek.notes.some(text=>text.includes('解除')));settleRouteWeek(s);}
+    assert.equal(E.locked(s,project),'');assert.deepEqual(s.conditions,[]);
+  }
+  const s=routeFixture('undecided',3,1);E.buyItem(s,'repair-kit');s.phase='event';s.pendingEvent=event.id;
+  assert.ok(E.choiceConsequencesText(s,event.choices[1]).some(text=>text.includes('消耗')));const result=E.choose(s,1);
+  assert.equal(s.inventory['repair-kit'],undefined);assert.deepEqual(s.conditions,[]);assert.ok(result.changes.some(text=>text.includes('维修工具包')));
+});
+
+test('lasting experiences affect actual work, attribute checks and route forecasts',()=>{
+  const plain=routeFixture('job',5,1,{code:50,research:50,social:50,algorithm:50,jobPrep:60,interviewPrep:40,projects:1,papers:0,internSteps:0}),experienced=E.clone(plain);
+  experienced.perks=['client-trust','maintainer-contact','study-partner','campus-users','conference-network'];
+  assert.ok(Math.abs(E.checkChance(experienced,{stat:'code',difficulty:50})-E.checkChance(plain,{stat:'code',difficulty:50})-.05)<1e-10);
+  assert.equal(E.routeStatus(experienced).forecast.min-E.routeStatus(plain).forecast.min,6);
+  assert.equal(E.routeStatus(experienced,'recommend').forecast.min-E.routeStatus(plain,'recommend').forecast.min,3);
+  const retest=routeFixture('exam',8,1,{code:50,research:50,social:50,interviewPrep:40,routeResults:{recommend:null,written:routeRecord('written'),retest:null,job:null}}),partner=E.clone(retest);
+  partner.perks=['conference-network'];assert.equal(E.routeStatus(partner).forecast.min-E.routeStatus(retest).forecast.min,3);
+  for(const s of [plain,experienced]){plan(s,['work','course','project']);E.advance(s);}
+  assert.equal(experienced.money-plain.money,80);assert.equal(experienced.study-plain.study,3);assert.equal(experienced.projectProgress-plain.projectProgress,5);
+});
+
+test('an event-acquired item has the displayed cost, enters the bag and unlocks its real action',()=>{
+  const event=D.events.find(e=>e.id==='secondhand-bookstall'),s=pending(event);s.money=179;
+  unchangedOnError(s,()=>E.choose(s,0));s.money=180;
+  assert.ok(E.choiceConsequencesText(s,event.choices[0]).some(text=>text.includes('算法书')));
+  const result=E.choose(s,0);assert.equal(result.effects.money,-180);assert.equal(s.money,0);assert.equal(s.inventory['algorithm-book'],1);
+  assert.ok(result.changes.some(text=>text.includes('算法书')));assert.equal(E.locked(s,D.actions.find(a=>a.id==='book-study')),'');
+  assert.deepEqual(E.validate(JSON.parse(JSON.stringify(s))),s);
+  s.phase='event';s.pendingEvent=event.id;s.money=180;unchangedOnError(s,()=>E.choose(s,0));
+});
+
+test('once-only encounters never return when all ordinary encounters have been seen',()=>{
+  const s=routeFixture('undecided',3,1);s.seen=D.events.map(event=>event.id);
+  const pool=E.eventPool(s);assert.ok(pool.length>0);assert.ok(pool.every(({event})=>!event.once&&!event.storyOnly));
+  for(let week=0;week<3;week++){plan(s,['rest','rest','rest']);E.advance(s);assert.ok(!D.events.find(event=>event.id===s.pendingEvent).once);resolve(s);}
+  const late=routeFixture('undecided',8,2),start=D.events.find(event=>event.id==='open-source-invite').choices[0];
+  assert.ok(E.choiceError(late,start));
+});
+
+test('old saves without shop and story fields retain their state with empty new collections',()=>{
+  const old=fresh();plan(old,['course','code','rest']);E.advance(old);resolve(old);
+  for(const key of ['inventory','buffs','perks','conditions','stories'])delete old[key];
+  delete old.lastEvent.changes;delete old.lastWeek.notes;
+  const loaded=E.validate(JSON.parse(JSON.stringify(old)));
+  for(const [key,value]of Object.entries(old))assert.deepEqual(loaded[key],value,key);
+  assert.deepEqual(loaded.inventory,{});assert.deepEqual(loaded.buffs,{});assert.deepEqual(loaded.stories,{});assert.deepEqual(loaded.perks,[]);assert.deepEqual(loaded.conditions,[]);
+  assert.deepEqual(E.validate(JSON.parse(JSON.stringify(loaded))),loaded);
+});
+
+test('invalid inventory, effect, experience and story records are rejected',()=>{
+  const record={status:'active',progress:1,startedWeek:6,dueWeek:9,resolvedWeek:null,ending:''};
+  const cases=[s=>s.inventory=null,s=>s.inventory=[],s=>s.inventory={coffee:0},s=>s.inventory={coffee:4},s=>s.inventory={coffee:1.5},s=>s.inventory={missing:1},s=>s.buffs={focus:3},s=>s.buffs={focus:0},s=>s.buffs={missing:1},s=>s.perks=['missing'],s=>s.perks=['client-trust','client-trust'],s=>s.conditions=['missing'],s=>s.conditions=['broken-laptop','broken-laptop'],s=>s.stories=[],s=>s.stories={missing:record},s=>s.stories.freelance={...record,progress:3},s=>s.stories.freelance={...record,dueWeek:10},s=>s.stories.freelance={...record,startedWeek:10,dueWeek:13},s=>s.stories.freelance={...record,status:'completed',resolvedWeek:8},s=>s.stories.freelance={...record,resolvedWeek:8},s=>s.stories.freelance={...record,status:'abandoned',resolvedWeek:10},s=>s.lastWeek={semester:3,week:1,effects:{},notes:[42]}];
+  for(const mutate of cases){const s=routeFixture('undecided',3,1);mutate(s);assert.throws(()=>E.validate(s));}
+  const missingStory=routeFixture('undecided',3,1);missingStory.phase='event';missingStory.pendingEvent='freelance-delivery';assert.throws(()=>E.validate(missingStory));
+});
 
 test('route selection permits early planning, guards transitions and retains preparation',()=>{
   const s=fresh();E.selectRoute(s,'recommend');assert.equal(s.route,'recommend');
@@ -350,7 +542,8 @@ test('event selection prioritizes unseen eligible events and reuses only eligibl
   assert.deepEqual(E.eventPool(s).map(({event})=>event.id),[remaining.id]);
   s.seen=D.events.map(e=>e.id);
   const reused=E.eventPool(s);
-  assert.deepEqual(new Set(reused.map(({event})=>event.id)),new Set(eligible.map(e=>e.id)));
+  assert.deepEqual(new Set(reused.map(({event})=>event.id)),new Set(D.events.filter(e=>E.eventWeight(s,e)>0).map(e=>e.id)));
+  assert.ok(reused.every(({event})=>!event.once&&!event.storyOnly));
   assert.ok(reused.every(({event,weight})=>weight>0&&weight===E.eventWeight(s,event)));
 });
 
@@ -439,7 +632,8 @@ test('every real event has a free unconditional option for a character with no r
   const s=E.create({talents:[],seed:42});
   for(const stat of ['code','theory','algorithm','research','social','health','mood','money'])s[stat]=0;
   for(const event of D.events){
-    const safe=event.choices.find(c=>!c.check&&!c.require&&(c.effects?.money||0)>=0);
+    if(event.storyOnly){const def=D.stories.find(story=>story.id===event.storyId);s.stories[def.id]={status:'active',progress:0,startedWeek:1,dueWeek:1+def.duration,resolvedWeek:null,ending:''};}
+    const safe=event.choices.find(c=>!c.check&&!c.require&&!c.requireStoryComplete&&(c.effects?.money||0)>=0&&!E.choiceError(s,c));
     assert.ok(safe,`${event.id} needs a safe option`);assert.equal(E.choiceError(s,safe),'',event.id);
   }
 });

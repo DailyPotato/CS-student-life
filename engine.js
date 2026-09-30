@@ -22,9 +22,11 @@
     return draw;
   }
   function chosenTalents(s){return s.talents.map(id=>D.talents.find(t=>t.id===id)).filter(Boolean);}
+  function activeBenefits(s){return [...chosenTalents(s),...D.items.filter(item=>s.inventory[item.id]>0&&item.kind==='permanent'),...D.buffs.filter(buff=>s.buffs[buff.id]>0),...D.perks.filter(perk=>s.perks.includes(perk.id))];}
+  const calendarWeek=s=>(s.semester-1)*4+s.week;
   function actionEffects(s,a){
     const effects={...a.effects};
-    for(const t of chosenTalents(s))for(const[k,v]of Object.entries(t.actions?.[a.id]||{}))effects[k]=(effects[k]||0)+v;
+    for(const benefit of activeBenefits(s))for(const[k,v]of Object.entries(benefit.actions?.[a.id]||{}))effects[k]=(effects[k]||0)+v;
     if(a.id==='course')effects.study=(effects.study||0)+Math.floor(s.theory/20);
     if(a.id==='project')effects.projectProgress=(effects.projectProgress||0)+25+Math.floor(clamp(s.code+(effects.code||0))/20)*5;
     if(a.id==='lab')effects.paperProgress=(effects.paperProgress||0)+20+(clamp(s.research+(effects.research||0))>=60?5:0)+Math.floor(s.social/25)*2;
@@ -44,6 +46,7 @@
       code:8,theory:8,algorithm:5,research:0,social:10,health:85,mood:80,money:bg.money,
       study:0,thesis:0,projectProgress:0,paperProgress:0,projects:0,papers:0,awards:0,internSteps:0,
       route:'undecided',recommendPrep:0,examPrep:0,jobPrep:0,interviewPrep:0,routeResults:{recommend:null,written:null,retest:null,job:null},
+      inventory:{},buffs:{},perks:[],conditions:[],stories:{},
       credits:0,failed:0,grades:[],achievements:[],seen:[],log:[],pendingEvent:null,lastEvent:null,lastWeek:null,report:null,ending:null,weeksPlayed:0};
     apply(s,bg.bonus);
     for(const t of chosenTalents(s))apply(s,t.start);
@@ -63,9 +66,97 @@
       else if(['money','study','projectProgress','paperProgress'].includes(key)) s[key]=Math.max(0,s[key]+value);
     }
   }
+  function buyError(s,item){
+    if(!item)return '未知道具';
+    if(s.phase!=='planning')return '请先完成当前事件或学期结算';
+    if((s.inventory[item.id]||0)>=item.max)return item.kind==='permanent'?'已经拥有，无需重复购买':'背包已达到持有上限';
+    if(s.money<item.price)return '生活费不足，还差 ¥'+(item.price-s.money);
+    let budget=s.money-item.price;
+    for(const id of s.plan){budget+=actionEffects(s,D.actions.find(a=>a.id===id)).money||0;if(budget<0)return '需要为本周已安排的行动保留生活费';}
+    return '';
+  }
+  function useError(s,item){
+    if(!item)return '未知道具';
+    if(s.phase!=='planning')return '请先完成当前事件或学期结算';
+    if(!(s.inventory[item.id]>0))return '背包中没有这件道具';
+    if(item.kind!=='consumable')return item.kind==='ticket'?'在行动中安排活动后使用门票':'持有即生效，无需使用';
+    if(item.buff&&s.buffs[item.buff])return '同类效果仍在生效，剩余 '+s.buffs[item.buff]+' 周';
+    if(item.clearCondition&&!s.conditions.includes(item.clearCondition))return '当前没有需要处理的'+D.conditions.find(c=>c.id===item.clearCondition).name;
+    return '';
+  }
+  function itemStatus(s,id){const item=D.items.find(item=>item.id===id),buyReason=buyError(s,item),useReason=useError(s,item);return {owned:s.inventory[id]||0,canBuy:!buyReason,buyReason,canUse:!useReason,useReason};}
+  function buyItem(s,id){
+    const item=D.items.find(item=>item.id===id),reason=buyError(s,item);if(reason)throw Error(reason);
+    const before=growthSnapshot(s);s.money-=item.price;s.inventory[id]=(s.inventory[id]||0)+1;
+    const changes=[`获得「${item.name}」×1`];
+    log(s,`校园商店：花费 ¥${item.price}，购买「${item.name}」。`,'milestone');
+    return {title:'购买成功',text:item.desc,changes,effects:growthChanges(before,growthSnapshot(s))};
+  }
+  function useItem(s,id){
+    const item=D.items.find(item=>item.id===id),reason=useError(s,item);if(reason)throw Error(reason);
+    const before=growthSnapshot(s);apply(s,item.useEffects);
+    const changes=applyConsequences(s,{consumeItem:id,buff:item.buff,clearCondition:item.clearCondition});
+    log(s,`使用「${item.name}」：${changes.join('；')}${effectsText(growthChanges(before,growthSnapshot(s)))}`,'milestone');
+    return {title:'使用成功',text:item.desc,changes,effects:growthChanges(before,growthSnapshot(s))};
+  }
+  function storyStatus(s,id){
+    const def=D.stories.find(story=>story.id===id),story=s.stories[id];if(!def||!story)return null;
+    const current=calendarWeek(s),remainingWeeks=Math.max(0,story.dueWeek-current+(s.phase==='planning'?1:0));
+    return {...story,id,name:def.name,desc:def.desc,actionName:D.actions.find(a=>a.id===def.actionId).name,target:def.target,remainingWeeks,ready:story.progress>=def.target||current>story.dueWeek||(current===story.dueWeek&&s.phase!=='planning'),rewardDesc:def.rewardDesc};
+  }
+  function consequenceError(s,c){
+    const required=c.requireItem||c.consumeItem;
+    if(required&&!(s.inventory[required]>0))return '需要持有'+D.items.find(i=>i.id===required).name;
+    if(c.acquireItem){const item=D.items.find(i=>i.id===c.acquireItem);if((s.inventory[item.id]||0)>=item.max)return '已经拥有或背包已满：'+item.name;}
+    if(c.startStory){
+      const def=D.stories.find(story=>story.id===c.startStory);
+      if(s.stories[def.id])return '已经体验过这段故事';
+      if(calendarWeek(s)+def.duration>32)return '毕业前已没有足够时间开启这段故事';
+    }
+    if(c.resolveStory&&s.stories[c.resolveStory.id]?.status!=='active')return '这段故事当前不在进行中';
+    const complete=c.requireStoryComplete||(c.resolveStory?.outcome==='completed'?c.resolveStory.id:null);
+    if(complete){const def=D.stories.find(story=>story.id===complete),story=s.stories[complete];if(story?.status!=='active'||story.progress<def.target)return `需要完成 ${def.target} 次${D.actions.find(a=>a.id===def.actionId).name}`;}
+    return '';
+  }
+  function choiceConsequencesText(s,c){
+    const changes=[];
+    if(c.acquireItem)changes.push('获得道具：'+D.items.find(i=>i.id===c.acquireItem).name+'（存入背包）');
+    if(c.consumeItem)changes.push('消耗道具：'+D.items.find(i=>i.id===c.consumeItem).name+' ×1');
+    if(c.startStory){const def=D.stories.find(story=>story.id===c.startStory),action=D.actions.find(a=>a.id===def.actionId);changes.push(`开启故事「${def.name}」：${def.duration} 周内完成 ${def.target} 次${action.name}，之后触发后续选择`,def.rewardDesc);}
+    if(c.resolveStory)changes.push((c.resolveStory.outcome==='completed'?'完成':'结束')+'故事「'+D.stories.find(story=>story.id===c.resolveStory.id).name+'」，留下故事记录');
+    if(c.grantPerk){const perk=D.perks.find(p=>p.id===c.grantPerk);changes.push(`长期收获「${perk.name}」：${perk.desc}`);}
+    if(c.addCondition){const condition=D.conditions.find(cn=>cn.id===c.addCondition);changes.push(condition.name+'：'+condition.desc);}
+    if(c.clearCondition)changes.push('解除状态：'+D.conditions.find(cn=>cn.id===c.clearCondition).name);
+    if(c.buff){const buff=D.buffs.find(b=>b.id===c.buff);changes.push(`获得「${buff.name}」：接下来 ${buff.duration} 周生效`);}
+    return changes;
+  }
+  function applyConsequences(s,c){
+    const changes=[];
+    if(c.consumeItem){s.inventory[c.consumeItem]--;if(s.inventory[c.consumeItem]===0)delete s.inventory[c.consumeItem];changes.push('消耗「'+D.items.find(i=>i.id===c.consumeItem).name+'」×1');}
+    if(c.acquireItem){s.inventory[c.acquireItem]=(s.inventory[c.acquireItem]||0)+1;changes.push('获得「'+D.items.find(i=>i.id===c.acquireItem).name+'」×1');}
+    if(c.buff){const buff=D.buffs.find(b=>b.id===c.buff);s.buffs[buff.id]=buff.duration;changes.push(`${buff.name}：接下来 ${buff.duration} 周生效`);}
+    if(c.addCondition&&!s.conditions.includes(c.addCondition)){s.conditions.push(c.addCondition);changes.push('出现持续状态：'+D.conditions.find(cn=>cn.id===c.addCondition).name);}
+    if(c.clearCondition&&s.conditions.includes(c.clearCondition)){s.conditions=s.conditions.filter(id=>id!==c.clearCondition);changes.push('已解除：'+D.conditions.find(cn=>cn.id===c.clearCondition).name);}
+    if(c.grantPerk&&!s.perks.includes(c.grantPerk)){s.perks.push(c.grantPerk);const perk=D.perks.find(p=>p.id===c.grantPerk);changes.push(`获得长期收获「${perk.name}」：${perk.desc}`);}
+    if(c.startStory){const def=D.stories.find(story=>story.id===c.startStory);s.stories[def.id]={status:'active',progress:0,startedWeek:calendarWeek(s),dueWeek:calendarWeek(s)+def.duration,resolvedWeek:null,ending:''};changes.push(`开启「${def.name}」：${def.duration} 周内完成 ${def.target} 次${D.actions.find(a=>a.id===def.actionId).name}`);}
+    if(c.resolveStory){const story=s.stories[c.resolveStory.id];story.status=c.resolveStory.outcome;story.resolvedWeek=calendarWeek(s);story.ending=c.result||'这段故事告一段落。';changes.push('故事'+(story.status==='completed'?'完成':'结束')+'：'+D.stories.find(def=>def.id===c.resolveStory.id).name);}
+    return changes;
+  }
   function locked(s,a) {
     if(!a) return '未知行动';
     const r=a.require||{};
+    const condition=D.conditions.find(c=>s.conditions.includes(c.id)&&c.blocks.includes(a.id));
+    if(condition)return condition.name+'：'+condition.desc;
+    if(a.requireItem&&!(s.inventory[a.requireItem]>0))return '需要持有'+D.items.find(item=>item.id===a.requireItem).name;
+    if(a.consumeItem&&!(s.inventory[a.consumeItem]>0))return '道具数量不足';
+    if(a.requireCondition&&!s.conditions.includes(a.requireCondition))return '目前不需要'+a.name;
+    if(a.requireStory){
+      const story=s.stories[a.requireStory],def=D.stories.find(story=>story.id===a.requireStory);
+      if(!story)return '需先加入「'+def.name+'」故事';
+      if(story.status==='completed'&&a.allowCompletedStory)return '';
+      if(story.status!=='active')return '这段故事已经结束';
+      if(calendarWeek(s)>story.dueWeek)return '故事已到期，请先处理后续';
+    }
     if(a.routes){
       if(!a.routes.includes(s.route))return '请先选择'+a.routes.map(id=>D.routes.find(r=>r.id===id).name).join(' / ')+'路线';
       const routeReason=routeActionError(s,a.id);if(routeReason)return routeReason;
@@ -83,6 +174,7 @@
     const a=D.actions.find(x=>x.id===id), reason=locked(s,a);
     if(reason) return reason;
     if(id==='retake' && s.plan.filter(x=>x===id).length>=s.failed) return '补考已安排';
+    if(a.consumeItem&&s.plan.filter(id=>D.actions.find(a=>a.id===id).consumeItem===a.consumeItem).length>=(s.inventory[a.consumeItem]||0))return '已安排使用现有道具，请先购买更多';
     const budget=s.money+s.plan.reduce((v,p)=>v+(actionEffects(s,D.actions.find(x=>x.id===p)).money||0),0);
     if(budget+(actionEffects(s,a).money||0)<0) return '生活费不足，先安排兼职';
     return '';
@@ -100,8 +192,10 @@
   function action(s,id) {
     const a=D.actions.find(x=>x.id===id),reason=locked(s,a);
     const e=actionEffects(s,a);
-    if(reason || s.money+(e.money||0)<0) {log(s,`${a.name}未能进行：${reason||'生活费不足'}，改为好好休息。`);apply(s,{health:12,mood:18});return;}
+    if(reason || s.money+(e.money||0)<0) {log(s,`${a.name}未能进行：${reason||'生活费不足'}，改为好好休息。`);apply(s,{health:12,mood:18});return [];}
     apply(s,e);
+    const notes=applyConsequences(s,a);
+    for(const def of D.stories){const story=s.stories[def.id];if(story?.status==='active'&&def.actionId===id&&calendarWeek(s)<=story.dueWeek&&story.progress<def.target){story.progress++;notes.push(`${def.name}：${story.progress} / ${def.target}${story.progress===def.target?'，已达目标，等待后续':''}`);}}
     if(id==='intern') {s.internSteps++;if(s.internSteps%2===0)log(s,`完成第 ${s.internSteps/2} 段实习，简历里多了一段真实的经历。`,'milestone');}
     if(id==='contest') {
       const chance=clamp(.10+s.algorithm*.007+s.social*.001+chosenTalents(s).reduce((n,t)=>n+(t.contestBonus||0),0),0,.9);
@@ -111,9 +205,14 @@
     if(id==='retake') {s.failed--;s.credits+=8;const grade=s.grades.find(g=>g.gpa<2&&!g.repaired);if(grade){grade.repaired=true;grade.gpa=2;}log(s,'补考通过，补回了 8 学分。');}
     log(s,`${a.name} · ${Object.entries(e).map(([k,v])=>`${labels[k]} ${v>0?'+':''}${v}`).join('，')}`);
     milestones(s);
+    for(const note of notes)log(s,note,'milestone');
+    return notes;
   }
   function eventWeight(s,event){
+    if(event.storyOnly||(event.once&&s.seen.includes(event.id)))return 0;
     if(s.semester<(event.min||1)||s.semester>(event.max||8))return 0;
+    const starters=(event.choices||[]).filter(c=>c.startStory);
+    if(starters.length&&starters.every(c=>Boolean(consequenceError(s,c))))return 0;
     if(event.routes&&(!event.routes.includes(s.route)||routeActionError(s,'')))return 0;
     for(const r of event.requires||[]){if(!Number.isFinite(s[r.stat])||(r.min!==undefined&&s[r.stat]<r.min)||(r.max!==undefined&&s[r.stat]>r.max))return 0;}
     let weight=event.weight??1;
@@ -122,6 +221,8 @@
     return Math.max(0,weight);
   }
   function eventPool(s){
+    const due=D.stories.filter(def=>{const story=s.stories[def.id];return story?.status==='active'&&(story.progress>=def.target||calendarWeek(s)>=story.dueWeek);}).sort((a,b)=>s.stories[a.id].dueWeek-s.stories[b.id].dueWeek||a.id.localeCompare(b.id));
+    if(due.length)return [{event:D.events.find(e=>e.id===due[0].followupEvent),weight:1}];
     const eligible=D.events.map(event=>({event,weight:eventWeight(s,event)})).filter(x=>x.weight>0);
     const fresh=eligible.filter(x=>!s.seen.includes(x.event.id));
     return fresh.length?fresh:eligible;
@@ -130,18 +231,19 @@
     if(!choice)return '无效的事件选项';
     for(const[k,min]of Object.entries(choice.require||{}))if(!Number.isFinite(s[k])||s[k]<min)return `需要${labels[k]||k} ${min}`;
     if(s.money+(choice.effects?.money||0)<0)return '生活费不足';
-    return '';
+    return consequenceError(s,choice);
   }
   function checkChance(s,check){
     if(!check||!stats.includes(check.stat)||!Number.isFinite(check.difficulty))throw Error('无效的属性检定');
-    const bonus=chosenTalents(s).reduce((n,t)=>n+(t.checkBonuses?.[check.stat]||0),0);
+    const bonus=activeBenefits(s).reduce((n,t)=>n+(t.checkBonuses?.[check.stat]||0),0);
     return clamp(.55+(s[check.stat]-check.difficulty)*.008+bonus,.10,.95);
   }
   function advance(s) {
     if(s.phase!=='planning'||s.plan.length!==3) throw Error('请先安排 3 项行动');
     const before=growthSnapshot(s);
     const plan=[...s.plan];s.plan=[];
-    for(const id of plan) action(s,id);
+    const notes=[];
+    for(const id of plan) notes.push(...action(s,id));
     const bg=D.backgrounds.find(b=>b.id===s.background);
     const expense=Math.max(0,180-chosenTalents(s).reduce((n,t)=>n+(t.expenseDiscount||0),0));
     apply(s,{money:bg.income-expense});
@@ -151,7 +253,8 @@
       apply(s,{health:25,mood:25,money:-Math.min(s.money,150)});
       log(s,'身体和情绪亮起红灯。你暂停额外安排，接受帮助并休整了一段时间（支出最多 ¥150）。下周记得留出休息。','warning');
     }
-    s.lastWeek={semester:s.semester,week:s.week,effects:growthChanges(before,growthSnapshot(s))};
+    for(const id of Object.keys(s.buffs)){s.buffs[id]--;if(s.buffs[id]===0){delete s.buffs[id];const note=D.buffs.find(b=>b.id===id).name+'已结束';notes.push(note);log(s,note);}}
+    s.lastWeek={semester:s.semester,week:s.week,effects:growthChanges(before,growthSnapshot(s)),notes};
     s.weeksPlayed++;
     const pool=eventPool(s);
     let roll=random(s)*pool.reduce((n,e)=>n+e.weight,0),ev=pool[pool.length-1].event;
@@ -169,11 +272,14 @@
     const before=growthSnapshot(s);
     apply(s,c.effects);
     if(c.check)apply(s,branch.effects);
+    const changes=applyConsequences(s,c);
+    if(c.check)changes.push(...applyConsequences(s,branch));
     milestones(s);
     const effects=growthChanges(before,growthSnapshot(s));
-    const result={title:event.title,result:branch.result,outcome,effects,chance};
+    const result={title:event.title,result:branch.result,outcome,effects,chance,changes};
     s.lastEvent=result;
     log(s,`${event.title}${outcome==='normal'?'':outcome==='success'?'【检定成功】':'【检定未达成】'}：${branch.result}${Object.keys(effects).length?'（'+effectsText(effects)+'）':''}`,'event');s.pendingEvent=null;
+    for(const change of changes)log(s,change,'milestone');
     settleRoutes(s);
     if(s.week===4) semesterEnd(s);else{s.week++;s.phase='planning';}
     return result;
@@ -194,7 +300,7 @@
   function continueTerm(s) {
     if(s.phase!=='report') throw Error('当前没有学期报告');
     s.report=null;
-    if(s.semester===8){s.phase='ending';s.ending=getEnding(s);if(s.ending.id!=='delayed'){unlock(s,'graduate');if(s.health>=80&&s.mood>=80)unlock(s,'balance');}log(s,`大学篇结束 · ${s.ending.title}`,'milestone');return;}
+    if(s.semester===8){for(const def of D.stories){const story=s.stories[def.id];if(story?.status==='active'){story.status='abandoned';story.resolvedWeek=32;story.ending='大学篇结束，这段尚未结算的故事留作遗憾。';log(s,def.name+'：'+story.ending,'milestone');}}s.phase='ending';s.ending=getEnding(s);if(s.ending.id!=='delayed'){unlock(s,'graduate');if(s.health>=80&&s.mood>=80)unlock(s,'balance');}log(s,`大学篇结束 · ${s.ending.title}`,'milestone');return;}
     s.semester++;s.week=1;s.study=0;s.phase='planning';apply(s,{health:12,mood:10});
     log(s,`假期结束，进入第 ${s.semester} 学期。假期休整：健康 +12，心态 +10。`,'milestone');
   }
@@ -243,6 +349,8 @@
       base=s.jobPrep*.3+s.interviewPrep*.25+s.code*.2+s.algorithm*.1+s.social*.05+Math.min(s.projects,3)/3*5+Math.min(Math.floor(s.internSteps/2),2)/2*5;threshold=60;label='校招综合评价';
       requirements=[requirement('求职准备 ≥ 60',s.jobPrep>=60,`${s.jobPrep} / 60`),requirement('编程能力 ≥ 40',s.code>=40,`${s.code} / 40`),requirement('至少完成一个项目',s.projects>=1,`已完成 ${s.projects} 个`)];
     }
+    const perkBonus=D.perks.filter(perk=>s.perks.includes(perk.id)).reduce((sum,perk)=>sum+(perk[stage+'ScoreBonus']||0),0);
+    base+=perkBonus;if(perkBonus)label+=`（长期收获 +${perkBonus}）`;
     return {base,threshold,requirements,label,min:Number(clamp(base-6).toFixed(1)),max:Number(clamp(base+6).toFixed(1))};
   }
   function routeStatus(s,id=s.route){
@@ -311,6 +419,22 @@
     for(const k of stats) ranges[k]=[0,100];
     for(const[k,[min,max]]of Object.entries(ranges))if(!Number.isFinite(s[k])||s[k]<min||s[k]>max||!Number.isInteger(s[k]))throw Error('存档数值无效：'+k);
     if(!['planning','event','report','ending'].includes(s.phase))throw Error('存档阶段无效');
+    for(const [key,catalog,maxValue]of [['inventory',D.items,item=>item.max],['buffs',D.buffs,buff=>buff.duration]]){
+      const values=s[key];if(values===undefined)continue;
+      if(!values||typeof values!=='object'||Array.isArray(values))throw Error('道具记录无效：'+key);
+      for(const [id,value]of Object.entries(values)){const entry=catalog.find(item=>item.id===id);if(!entry||!Number.isInteger(value)||value<1||value>maxValue(entry))throw Error('道具记录无效：'+key);}
+    }
+    for(const [key,catalog]of [['perks',D.perks],['conditions',D.conditions]]){const values=s[key];if(values!==undefined&&(!Array.isArray(values)||new Set(values).size!==values.length||values.some(id=>typeof id!=='string'||!catalog.some(item=>item.id===id))))throw Error('校园经历记录无效：'+key);}
+    if(s.stories!==undefined){
+      if(!s.stories||typeof s.stories!=='object'||Array.isArray(s.stories))throw Error('故事记录无效');
+      for(const [id,story]of Object.entries(s.stories)){
+        const def=D.stories.find(story=>story.id===id);
+        if(!def||!story||typeof story!=='object'||Array.isArray(story)||!['active','completed','abandoned'].includes(story.status)||!Number.isInteger(story.progress)||story.progress<0||story.progress>def.target||!Number.isInteger(story.startedWeek)||story.startedWeek<1||story.startedWeek>calendarWeek(s)||story.dueWeek!==story.startedWeek+def.duration||story.dueWeek>32||typeof story.ending!=='string'||story.ending.length>2000)throw Error('故事进度无效');
+        if(story.status==='active'&&(story.resolvedWeek!==null||story.ending!==''||s.phase==='ending'))throw Error('进行中的故事记录无效');
+        if(story.status!=='active'&&(!Number.isInteger(story.resolvedWeek)||story.resolvedWeek<story.startedWeek||story.resolvedWeek>calendarWeek(s)||story.resolvedWeek>32))throw Error('故事结局时间无效');
+        if(story.status==='completed'&&story.progress<def.target)throw Error('故事尚未达到完成目标');
+      }
+    }
     if(s.route!==undefined&&(typeof s.route!=='string'||!Object.hasOwn(routeNames,s.route)))throw Error('发展路线无效');
     for(const key of prepStats)if(s[key]!==undefined&&(!Number.isInteger(s[key])||s[key]<0||s[key]>100))throw Error('路线准备进度无效：'+key);
     if(s.routeResults!==undefined){
@@ -331,6 +455,8 @@
     if(!Array.isArray(s.achievements)||s.achievements.some(id=>!D.achievements.some(a=>a.id===id)))throw Error('成就数据无效');
     if(!Array.isArray(s.seen)||s.seen.length>D.events.length||s.seen.some(id=>!D.events.some(e=>e.id===id)))throw Error('事件数据无效');
     if(s.phase==='event'&&!D.events.some(e=>e.id===s.pendingEvent))throw Error('待处理事件无效');
+    if(s.phase==='event'){const event=D.events.find(e=>e.id===s.pendingEvent);if(event.storyOnly&&s.stories?.[event.storyId]?.status!=='active')throw Error('故事后续缺少进行中的故事');}
+    for(const notes of [s.lastEvent?.changes,s.lastWeek?.notes])if(notes!==undefined&&(!Array.isArray(notes)||notes.length>50||notes.some(note=>typeof note!=='string'||note.length>2000)))throw Error('校园变化记录无效');
     if(s.lastEvent!==undefined&&s.lastEvent!==null){const e=s.lastEvent;if(typeof e.title!=='string'||e.title.length>200||typeof e.result!=='string'||e.result.length>2000||!['success','failure','normal'].includes(e.outcome)||!e.effects||typeof e.effects!=='object'||Array.isArray(e.effects)||Object.entries(e.effects).some(([k,v])=>!Object.hasOwn(labels,k)||!Number.isFinite(v)||Math.abs(v)>1000000)||(e.chance!==null&&(!Number.isFinite(e.chance)||e.chance<.1||e.chance>.95)))throw Error('事件结果无效');}
     if(s.lastWeek!==undefined&&s.lastWeek!==null){const w=s.lastWeek;if(!Number.isInteger(w.semester)||w.semester<1||w.semester>8||!Number.isInteger(w.week)||w.week<1||w.week>4||!w.effects||typeof w.effects!=='object'||Array.isArray(w.effects)||Object.entries(w.effects).some(([k,v])=>!Object.hasOwn(labels,k)||!Number.isFinite(v)||Math.abs(v)>1000000))throw Error('每周成长记录无效');}
     if(s.phase==='report'&&(!s.report||s.week!==4||s.report.semester!==s.semester||!Number.isFinite(s.report.gpa)||s.report.gpa<0||s.report.gpa>4||![12,20].includes(s.report.credits)||![0,300,600].includes(s.report.scholarship)||typeof s.report.passed!=='boolean'))throw Error('学期报告无效');
@@ -340,6 +466,6 @@
     if(s.phase==='ending')clean.ending=getEnding(clean);
     return clean;
   }
-  const E={create,drawTalents,gpa,semesterForecast,actionPreview,selectRoute,routeStatus,locked,planError,addPlan,removePlan,advance,choose,continueTerm,getEnding,effectsText,eventWeight,eventPool,choiceError,checkChance,validate,clone,labels};
+  const E={create,drawTalents,gpa,semesterForecast,actionPreview,selectRoute,routeStatus,itemStatus,buyItem,useItem,storyStatus,choiceConsequencesText,locked,planError,addPlan,removePlan,advance,choose,continueTerm,getEnding,effectsText,eventWeight,eventPool,choiceError,checkChance,validate,clone,labels};
   root.CS_ENGINE=E;if(typeof module!=='undefined')module.exports=E;
 })(typeof globalThis!=='undefined'?globalThis:window);
