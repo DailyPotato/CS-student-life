@@ -7,6 +7,201 @@ const plan=(s,ids)=>ids.forEach(id=>E.addPlan(s,id));
 const resolve=s=>{const event=D.events.find(e=>e.id===s.pendingEvent);const choices=event.choices.map((choice,index)=>({choice,index})).filter(({choice})=>!E.choiceError(s,choice));const safe=choices.find(({choice})=>!choice.check);assert.ok(safe||choices[0],`${event.id} must have an available choice`);return E.choose(s,(safe||choices[0]).index);};
 const withEvent=(event,run)=>{D.events.push(event);try{return run(event);}finally{D.events.pop();}};
 const pending=(event,seed=42)=>{const s=E.create({background:'ordinary',talents:[],seed});s.phase='event';s.pendingEvent=event.id;return s;};
+const routeFixture=(route,semester,week,overrides={})=>{
+  const s=E.create({talents:[],seed:42});
+  Object.assign(s,{semester,week,weeksPlayed:(semester-1)*4+week-1,credits:(semester-1)*20,study:100,code:100,theory:100,algorithm:100,research:100,social:100,health:100,mood:100,projects:3,papers:1,internSteps:4,recommendPrep:100,examPrep:100,jobPrep:100,interviewPrep:100});
+  s.grades=Array.from({length:semester-1},(_,i)=>({semester:i+1,gpa:4,repaired:false}));
+  Object.assign(s,overrides);E.selectRoute(s,route);return s;
+};
+const settleRouteWeek=s=>withEvent({id:'test-route-neutral',title:'平静的一周',choices:[{result:'按计划继续生活。',effects:{}}]},event=>{s.phase='event';s.pendingEvent=event.id;return E.choose(s,0);});
+const routeRecord=(stage,status='success',score=90)=>{const [semester,week]={recommend:[7,2],written:[7,4],retest:[8,2],job:[8,3]}[stage];return {status,score,reason:'已结算的阶段结果',semester,week};};
+
+test('route selection permits early planning, guards transitions and retains preparation',()=>{
+  const s=fresh();E.selectRoute(s,'recommend');assert.equal(s.route,'recommend');
+  assert.ok(E.locked(s,D.actions.find(a=>a.id==='recommend-prepare')),'specialized preparation begins in year three');
+  Object.assign(s,{recommendPrep:34,examPrep:27,jobPrep:12,interviewPrep:45});
+  E.selectRoute(s,'exam');E.selectRoute(s,'job');E.selectRoute(s,'undecided');
+  assert.deepEqual([s.recommendPrep,s.examPrep,s.jobPrep,s.interviewPrep],[34,27,12,45]);
+  for(const phase of ['event','report','ending']){
+    s.phase=phase;const before=JSON.stringify(s);assert.throws(()=>E.selectRoute(s,'recommend'));assert.equal(JSON.stringify(s),before);
+  }
+  s.phase='planning';E.addPlan(s,'course');
+  const before=JSON.stringify(s);assert.throws(()=>E.selectRoute(s,'recommend'));assert.equal(JSON.stringify(s),before);
+  E.removePlan(s,0);assert.throws(()=>E.selectRoute(s,'unknown'));assert.throws(()=>E.selectRoute(s,['exam']));assert.equal(s.route,'undecided');
+});
+
+test('route actions and events require the selected route and an open stage',()=>{
+  const actions={recommend:'recommend-prepare',exam:'exam-study',job:'job-prepare'};
+  const events=D.events.filter(e=>e.routes);
+  assert.ok(events.length>=3);
+  for(const route of Object.keys(actions)){
+    const s=routeFixture(route,5,1);
+    for(const [candidate,id]of Object.entries(actions))assert.equal(Boolean(E.locked(s,D.actions.find(a=>a.id===id))),candidate!==route,id);
+    assert.equal(E.locked(s,D.actions.find(a=>a.id==='route-interview')),'');
+    const currentEvents=events.filter(e=>(e.min||1)<=5&&(e.max||8)>=5);
+    for(const event of currentEvents)assert.equal(E.eventWeight(s,event)>0,event.routes.includes(route),event.id);
+    const id=actions[route],key={recommend:'recommendPrep',exam:'examPrep',job:'jobPrep'}[route];
+    s[key]=0;const preview=E.actionPreview(s,id);plan(s,[id,'rest','rest']);E.advance(s);
+    assert.equal(s[key],preview[key]);assert.equal(s.lastWeek.effects[key],preview[key]);
+  }
+  const closed=routeFixture('recommend',7,2);settleRouteWeek(closed);
+  assert.ok(E.locked(closed,D.actions.find(a=>a.id==='recommend-prepare')));
+  for(const event of events.filter(e=>e.routes.includes('recommend')))assert.equal(E.eventWeight(closed,event),0,event.id);
+});
+
+test('missed and failed routes cannot reopen, while a successful destination can be selected again',()=>{
+  const missed=routeFixture('undecided',7,3);
+  assert.throws(()=>E.selectRoute(missed,'recommend'));
+  E.selectRoute(missed,'exam');assert.equal(missed.route,'exam');
+  const failed=routeFixture('recommend',7,2,{recommendPrep:59});settleRouteWeek(failed);
+  assert.equal(failed.routeResults.recommend.status,'failure');E.selectRoute(failed,'job');
+  const before=JSON.stringify(failed);assert.throws(()=>E.selectRoute(failed,'recommend'));assert.equal(JSON.stringify(failed),before);
+  const successful=routeFixture('recommend',7,2);settleRouteWeek(successful);
+  const result=JSON.parse(JSON.stringify(successful.routeResults.recommend));
+  E.selectRoute(successful,'job');E.selectRoute(successful,'recommend');
+  assert.equal(successful.route,'recommend');assert.deepEqual(successful.routeResults.recommend,result);
+});
+
+test('recommendation, written examination and hiring settle at their deadline only once',()=>{
+  for(const [route,key,semester,week]of [['recommend','recommend',7,2],['exam','written',7,4],['job','job',8,3]]){
+    const s=routeFixture(route,semester,week-1);settleRouteWeek(s);
+    assert.equal(s.week,week);assert.equal(s.routeResults[key],null);
+    const loaded=E.validate(JSON.parse(JSON.stringify(s))),forecast=E.routeStatus(s).forecast;
+    settleRouteWeek(s);settleRouteWeek(loaded);
+    assert.deepEqual(loaded,s);assert.equal(s.routeResults[key].status,'success');
+    const result=JSON.parse(JSON.stringify(s.routeResults[key]));
+    assert.equal(result.semester,semester);assert.equal(result.week,week);
+    assert.ok(result.score>=forecast.min&&result.score<=forecast.max);
+    const before=JSON.stringify(s);assert.throws(()=>E.choose(s,0));assert.equal(JSON.stringify(s),before);
+    if(s.phase==='report')E.continueTerm(s);
+    settleRouteWeek(s);assert.deepEqual(s.routeResults[key],result,'later weeks must not reroll a settled result');
+  }
+});
+
+test('recommendation enforces the first six GPAs, pending retakes, preparation and research or contest evidence',()=>{
+  const grades=gpa=>Array.from({length:6},(_,i)=>({semester:i+1,gpa,repaired:false}));
+  const cases=[
+    [{grades:grades(3.5)},'success'],[{grades:grades(3.49)},'failure'],[{failed:1},'failure'],
+    [{papers:0,awards:0},'failure'],[{papers:0,awards:1},'success'],[{recommendPrep:59},'failure']
+  ];
+  for(const [overrides,status]of cases){const s=routeFixture('recommend',7,2,overrides);settleRouteWeek(s);assert.equal(s.routeResults.recommend.status,status,JSON.stringify(overrides));}
+  const s=routeFixture('recommend',7,2,{grades:grades(3.5)});settleRouteWeek(s);
+  const original=JSON.parse(JSON.stringify(s.routeResults.recommend));
+  s.grades.push({semester:7,gpa:0,repaired:false});s.semester=8;s.week=1;
+  assert.equal(E.routeStatus(s).requirements[0].met,true,'a seventh-semester grade cannot change the first-six GPA');
+  assert.deepEqual(s.routeResults.recommend,original);assert.deepEqual(E.validate(JSON.parse(JSON.stringify(s))),s);
+});
+
+test('passing the written examination opens the retest while failure keeps it closed',()=>{
+  const event=D.events.find(e=>e.id==='exam-retest-practice'),interview=D.actions.find(a=>a.id==='route-interview');
+  const passed=routeFixture('exam',7,4);settleRouteWeek(passed);
+  assert.equal(passed.routeResults.written.status,'success');assert.equal(passed.routeResults.retest,null);
+  E.continueTerm(passed);assert.match(E.routeStatus(passed).title,/复试/);
+  assert.ok(E.locked(passed,D.actions.find(a=>a.id==='exam-study')));assert.equal(E.locked(passed,interview),'');
+  assert.ok(E.eventWeight(passed,event)>0);
+  settleRouteWeek(passed);assert.equal(passed.routeResults.retest,null);
+  const loaded=E.validate(JSON.parse(JSON.stringify(passed)));settleRouteWeek(passed);settleRouteWeek(loaded);
+  assert.deepEqual(loaded,passed);assert.equal(passed.routeResults.retest.status,'success');
+  const result=JSON.parse(JSON.stringify(passed.routeResults.retest));settleRouteWeek(passed);assert.deepEqual(passed.routeResults.retest,result);
+  assert.equal(E.eventWeight(passed,event),0);assert.ok(E.locked(passed,interview));
+  const failed=routeFixture('exam',7,4,{examPrep:59});settleRouteWeek(failed);E.continueTerm(failed);
+  assert.equal(failed.routeResults.written.status,'failure');assert.equal(E.eventWeight(failed,event),0);assert.ok(E.locked(failed,interview));
+  settleRouteWeek(failed);settleRouteWeek(failed);assert.equal(failed.routeResults.retest,null);
+});
+
+test('retest and job preparation cannot replace their required evidence',()=>{
+  const retest=routeFixture('exam',7,4);settleRouteWeek(retest);E.continueTerm(retest);
+  retest.interviewPrep=39;settleRouteWeek(retest);settleRouteWeek(retest);
+  assert.equal(retest.routeResults.retest.status,'failure');assert.match(retest.routeResults.retest.reason,/面试准备/);
+  for(const overrides of [{projects:0},{code:39},{jobPrep:59}]){
+    const s=routeFixture('job',8,3,overrides);settleRouteWeek(s);assert.equal(s.routeResults.job.status,'failure',JSON.stringify(overrides));
+  }
+  const novice=routeFixture('job',8,3,{projects:1,internSteps:0});settleRouteWeek(novice);
+  assert.equal(novice.routeResults.job.status,'success','internships improve the score but are not a hard prerequisite');
+});
+
+test('selected-route endings take priority without bypassing graduation requirements',()=>{
+  for(const [route,key,successEnding,failureEnding]of [['recommend','recommend','recommend-admit','recommend-pending'],['exam','retest','exam-admit','exam-retry'],['job','job','job-offer','job-searching']]){
+    const s=routeFixture('undecided',8,4,{credits:160,thesis:100,papers:3,research:100});
+    s.phase='ending';s.route=route;s.routeResults[key]=routeRecord(key);
+    if(route==='exam')s.routeResults.written=routeRecord('written');
+    assert.equal(E.getEnding(s).id,successEnding);
+    assert.equal(E.getEnding({...s,credits:151}).id,'delayed');assert.equal(E.getEnding({...s,thesis:99}).id,'delayed');
+    s.routeResults[key]=routeRecord(key,'failure',40);assert.equal(E.getEnding(s).id,failureEnding);
+    s.routeResults[key]=null;assert.equal(E.getEnding(s).id,failureEnding);
+  }
+});
+
+test('old saves migrate missing route fields without losing progress or creating a destination',()=>{
+  const old=routeFixture('undecided',8,1,{code:61,projectProgress:47,thesis:25});
+  for(const key of ['route','recommendPrep','examPrep','jobPrep','interviewPrep','routeResults'])delete old[key];
+  const loaded=E.validate(JSON.parse(JSON.stringify(old)));
+  for(const [key,value]of Object.entries(old))assert.deepEqual(loaded[key],value,key);
+  assert.equal(loaded.route,'undecided');assert.deepEqual(loaded.routeResults,{recommend:null,written:null,retest:null,job:null});
+  for(const key of ['recommendPrep','examPrep','jobPrep','interviewPrep'])assert.equal(loaded[key],0);
+  assert.deepEqual(E.validate(JSON.parse(JSON.stringify(loaded))),loaded);
+  assert.throws(()=>E.selectRoute(loaded,'recommend'));assert.throws(()=>E.selectRoute(loaded,'exam'));
+  E.selectRoute(loaded,'job');assert.equal(loaded.route,'job');
+});
+
+test('invalid route saves reject malformed progress, premature results and impossible retests',()=>{
+  const cases=[
+    s=>s.route='unknown',s=>s.route=['exam'],s=>s.route={id:'exam'},s=>s.route=null,s=>s.recommendPrep=-1,s=>s.examPrep=101,s=>s.jobPrep=2.5,s=>s.interviewPrep=NaN,
+    s=>s.routeResults=null,s=>s.routeResults={},s=>s.routeResults.extra=null,
+    s=>s.routeResults.recommend={...routeRecord('recommend'),score:69},
+    s=>s.routeResults.recommend={...routeRecord('recommend'),status:'pending'},
+    s=>s.routeResults.recommend={...routeRecord('recommend'),week:1},
+    s=>s.routeResults.recommend={...routeRecord('recommend'),score:101},
+    s=>s.routeResults.recommend={...routeRecord('recommend'),reason:42},
+    s=>s.routeResults.retest=routeRecord('retest')
+  ];
+  for(const mutate of cases){const s=routeFixture('undecided',8,4);mutate(s);assert.throws(()=>E.validate(s));}
+  const premature=routeFixture('recommend',7,2);premature.routeResults.recommend=routeRecord('recommend');assert.throws(()=>E.validate(premature));
+});
+
+test('each route can be completed successfully through a real four-year game',()=>{
+  const destinations={recommend:'recommend-admit',exam:'exam-admit',job:'job-offer'};
+  const preparation={recommend:['recommend-prepare','recommendPrep'],exam:['exam-study','examPrep'],job:['job-prepare','jobPrep']};
+  function nextAction(s,route){
+    if(s.health<45||s.mood<40)return 'rest';
+    const [action,stat]=preparation[route];
+    if(s.semester>=5){
+      if(s[stat]<100&&!E.locked(s,D.actions.find(a=>a.id===action)))return action;
+      if(s.interviewPrep<100&&!E.locked(s,D.actions.find(a=>a.id==='route-interview')))return 'route-interview';
+    }
+    if(route==='recommend'){
+      if(s.semester>=3&&(s.research<95||s.papers<2))return 'lab';
+      if(s.social<60)return 'social';
+      if(s.code<40)return 'code';
+    }else if(route==='exam'){
+      if(s.algorithm<75)return 'algorithm';
+      if(s.code<60)return 'code';
+      if(s.semester>=3&&s.research<40)return 'lab';
+      if(s.social<50)return 'social';
+    }else{
+      if(s.code<40)return 'code';
+      if(s.projects<3)return 'project';
+      if(s.semester>=5&&s.internSteps<4)return 'intern';
+      if(s.algorithm<60)return 'algorithm';
+      if(s.social<50)return 'social';
+    }
+    return 'rest';
+  }
+  for(const route of Object.keys(destinations))for(const seed of [1,42,1000]){
+    const s=E.create({name:'路线测试',background:'ordinary',talents:['academic','healthy'],seed});E.selectRoute(s,route);
+    for(let week=0;week<32;week++){
+      E.addPlan(s,'course');
+      if(s.week===1||(s.semester<=2&&s.week===2))E.addPlan(s,'course');
+      if(s.semester>=7&&s.thesis<100)E.addPlan(s,'thesis');
+      while(s.plan.length<3)E.addPlan(s,nextAction(s,route));
+      E.advance(s);E.validate(s);resolve(s);E.validate(s);
+      if(s.phase==='report'){E.continueTerm(s);E.validate(s);}
+    }
+    assert.equal(s.phase,'ending');assert.equal(s.weeksPlayed,32);assert.equal(s.grades.length,8);
+    assert.ok(s.credits>=152);assert.equal(s.thesis,100);assert.equal(s.failed,0);
+    assert.equal(s.ending.id,destinations[route],`${route}, seed ${seed}: ${JSON.stringify({results:s.routeResults,research:s.research,code:s.code,algorithm:s.algorithm,social:s.social,interview:s.interviewPrep,grades:s.grades})}`);
+  }
+});
 
 test('talent draws are reproducible, unique and varied across new-game seeds',()=>{
   const known=new Set(D.talents.map(t=>t.id));
